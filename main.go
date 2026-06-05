@@ -17,11 +17,74 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const maxBodyBytes = 1024 * 1024
 
 var errPayloadTooLarge = errors.New("payload_too_large")
+
+type logFields map[string]any
+
+func logEvent(event string, fields logFields) {
+	payload := map[string]any{
+		"ts":      time.Now().UTC().Format(time.RFC3339),
+		"service": "loyalty-core-points",
+		"event":   event,
+	}
+
+	for key, value := range fields {
+		if value != nil {
+			payload[key] = value
+		}
+	}
+
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("{\"ts\":\"%s\",\"service\":\"loyalty-core-points\",\"event\":\"logger.error\",\"message\":\"json_marshal_failed\"}\n", time.Now().UTC().Format(time.RFC3339))
+		return
+	}
+
+	fmt.Println(string(bytes))
+}
+
+var (
+	metricsRegistry       = prometheus.NewRegistry()
+	coreHTTPRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "loyalty_core_http_requests_total",
+			Help: "Total HTTP requests handled by the core service",
+		},
+		[]string{"method", "route", "status_class", "status_code"},
+	)
+	coreBusinessTransactionsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "loyalty_core_business_transactions_total",
+			Help: "Business transactions processed by the core service",
+		},
+		[]string{"flow", "outcome"},
+	)
+	coreHTTPRequestDurationSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "loyalty_core_http_request_duration_seconds",
+			Help:    "HTTP request latency in seconds for the core service",
+			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1, 1.5, 2, 3, 5},
+		},
+		[]string{"method", "route", "status_class", "status_code"},
+	)
+)
+
+func init() {
+	metricsRegistry.MustRegister(
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewGoCollector(),
+		coreHTTPRequestsTotal,
+		coreBusinessTransactionsTotal,
+		coreHTTPRequestDurationSeconds,
+	)
+}
 
 type app struct {
 	db *pgxpool.Pool
@@ -34,6 +97,7 @@ type healthResponse struct {
 	ReceivedTransactions    int32  `json:"receivedTransactions"`
 	ReceivedPasswordChanges int32  `json:"receivedPasswordChanges"`
 	ReceivedLogins          int32  `json:"receivedLogins"`
+	ReceivedProfiles        int32  `json:"receivedProfiles"`
 }
 
 type enrollmentTrace struct {
@@ -86,6 +150,23 @@ type enrollmentListResponse struct {
 	Items []enrollmentTrace `json:"items"`
 }
 
+type customerProfileSummary struct {
+	CustomerID              string    `json:"customerId"`
+	CustomerEmailHash       string    `json:"customerEmailHash"`
+	FirstName               string    `json:"firstName"`
+	LastName                string    `json:"lastName"`
+	LoyaltyTier             string    `json:"loyaltyTier"`
+	EnrollmentStatus        string    `json:"enrollmentStatus"`
+	EnrollmentTransactionID string    `json:"enrollmentTransactionId"`
+	PasswordChangeStatus    string    `json:"passwordChangeStatus"`
+	PasswordChangeRequestID string    `json:"passwordChangeRequestId"`
+	LastLoginID             string    `json:"lastLoginId"`
+	LastLoginAt             time.Time `json:"lastLoginAt"`
+	Source                  string    `json:"source"`
+	Stage                   string    `json:"stage"`
+	UpdatedAt               time.Time `json:"updatedAt"`
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -94,7 +175,7 @@ func main() {
 	ctx := context.Background()
 	databaseURL, err := mustEnv("DATABASE_URL")
 	if err != nil {
-		log.Fatalf("Failed to start core-customer: %v", err)
+		log.Fatalf("Failed to start core-points: %v", err)
 	}
 
 	port := getPort()
@@ -116,7 +197,10 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("core-customer listening on http://localhost:%d using postgres", port)
+		logEvent("service.started", logFields{
+			"port":    port,
+			"storage": "postgres",
+		})
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
 		}
@@ -156,31 +240,85 @@ func getPort() int {
 	return port
 }
 
+func normalizeRoute(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/v1/customer-enrollments/"):
+		return "/v1/customer-enrollments/:transactionId"
+	case strings.HasPrefix(path, "/v1/customer-password-changes/"):
+		return "/v1/customer-password-changes/:requestId"
+	case strings.HasPrefix(path, "/v1/customer-logins/"):
+		return "/v1/customer-logins/:loginId"
+	case strings.HasPrefix(path, "/v1/customers/") && strings.HasSuffix(path, "/profile-summary"):
+		return "/v1/customers/:customerId/profile-summary"
+	default:
+		return path
+	}
+}
+
+func statusClass(statusCode int) string {
+	return fmt.Sprintf("%dxx", statusCode/100)
+}
+
+type metricsResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *metricsResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
 func (a *app) routes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/health":
-			a.handleHealth(w, r)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/customer-enrollments":
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", a.handleHealth)
+	mux.HandleFunc("/metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}).ServeHTTP)
+	mux.HandleFunc("/v1/customer-enrollments", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
 			a.handleListEnrollments(w, r)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/customer-enrollments":
+		case http.MethodPost:
 			a.handleCreateEnrollment(w, r)
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/customer-enrollments/"):
-			a.handleGetEnrollment(w, r)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/customer-password-changes":
-			a.handleCreatePasswordChange(w, r)
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/customer-password-changes/"):
-			a.handleGetPasswordChange(w, r)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/customer-logins":
-			a.handleCreateLogin(w, r)
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/customer-logins/"):
-			a.handleGetLogin(w, r)
 		default:
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"status": "not_found",
-				"path":   r.URL.Path,
-			})
+			writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "path": r.URL.Path})
 		}
+	})
+	mux.HandleFunc("/v1/customer-enrollments/", a.handleGetEnrollment)
+	mux.HandleFunc("/v1/customer-password-changes", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			a.handleCreatePasswordChange(w, r)
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "path": r.URL.Path})
+		}
+	})
+	mux.HandleFunc("/v1/customer-password-changes/", a.handleGetPasswordChange)
+	mux.HandleFunc("/v1/customer-logins", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			a.handleCreateLogin(w, r)
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "path": r.URL.Path})
+		}
+	})
+	mux.HandleFunc("/v1/customer-logins/", a.handleGetLogin)
+	mux.HandleFunc("/v1/customers/", a.handleGetCustomerProfileSummary)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		startedAt := time.Now()
+		wrapped := &metricsResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		mux.ServeHTTP(wrapped, r)
+
+		route := normalizeRoute(r.URL.Path)
+		statusCode := wrapped.statusCode
+		labels := prometheus.Labels{
+			"method":       r.Method,
+			"route":        route,
+			"status_class": statusClass(statusCode),
+			"status_code":  strconv.Itoa(statusCode),
+		}
+		coreHTTPRequestsTotal.With(labels).Inc()
+		coreHTTPRequestDurationSeconds.With(labels).Observe(time.Since(startedAt).Seconds())
 	})
 }
 
@@ -210,6 +348,54 @@ func (a *app) initDB(ctx context.Context) error {
 			source TEXT NOT NULL,
 			stage TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS customer_profiles (
+			customer_id TEXT PRIMARY KEY,
+			customer_email_hash TEXT NOT NULL,
+			first_name TEXT NOT NULL,
+			last_name TEXT NOT NULL,
+			loyalty_tier TEXT NOT NULL,
+			enrollment_status TEXT NOT NULL,
+			enrollment_transaction_id TEXT NOT NULL,
+			password_change_status TEXT NOT NULL,
+			password_change_request_id TEXT NOT NULL,
+			last_login_id TEXT NOT NULL,
+			last_login_at TIMESTAMPTZ NOT NULL,
+			source TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`INSERT INTO customer_profiles (
+			customer_id,
+			customer_email_hash,
+			first_name,
+			last_name,
+			loyalty_tier,
+			enrollment_status,
+			enrollment_transaction_id,
+			password_change_status,
+			password_change_request_id,
+			last_login_id,
+			last_login_at,
+			source,
+			stage,
+			updated_at
+		) VALUES (
+			'cust_001',
+			'hash_cust_001_demo',
+			'Pablo',
+			'Velasquez',
+			'gold',
+			'enrolled',
+			'tx-demo-001',
+			'completed',
+			'pwd-demo-001',
+			'login-demo-001',
+			TIMESTAMPTZ '2026-06-03T18:45:00Z',
+			'core-points',
+			'profile_summary_ready',
+			TIMESTAMPTZ '2026-06-03T18:45:00Z'
+		)
+		ON CONFLICT (customer_id) DO NOTHING`,
 	}
 
 	for _, statement := range statements {
@@ -227,7 +413,7 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	response := healthResponse{
 		Status:  "ok",
-		Service: "core-customer",
+		Service: "core-points",
 		Storage: "postgres",
 	}
 
@@ -238,13 +424,14 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 		{query: `SELECT COUNT(*)::int FROM customer_enrollment_traces`, target: &response.ReceivedTransactions},
 		{query: `SELECT COUNT(*)::int FROM customer_password_change_traces`, target: &response.ReceivedPasswordChanges},
 		{query: `SELECT COUNT(*)::int FROM customer_login_traces`, target: &response.ReceivedLogins},
+		{query: `SELECT COUNT(*)::int FROM customer_profiles`, target: &response.ReceivedProfiles},
 	}
 
 	for _, item := range queries {
 		if err := a.db.QueryRow(ctx, item.query).Scan(item.target); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"status":  "error",
-				"service": "core-customer",
+				"service": "core-points",
 				"message": "database_unavailable",
 			})
 			return
@@ -325,6 +512,12 @@ func (a *app) handleCreateEnrollment(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	logEvent("enrollment.received", logFields{
+		"transactionId":     payload.TransactionID,
+		"customerEmailHash": payload.CustomerEmailHash,
+		"remote":            r.RemoteAddr,
+	})
+
 	row := a.db.QueryRow(ctx, `INSERT INTO customer_enrollment_traces (
 			transaction_id,
 			customer_email_hash,
@@ -337,13 +530,21 @@ func (a *app) handleCreateEnrollment(w http.ResponseWriter, r *http.Request) {
 			source = EXCLUDED.source,
 			stage = EXCLUDED.stage
 		RETURNING transaction_id, customer_email_hash, received_at, source, stage`,
-		payload.TransactionID, payload.CustomerEmailHash, "bff-customer", "core_received")
+		payload.TransactionID, payload.CustomerEmailHash, "bff-points", "core_received")
 
 	trace, err := scanEnrollment(row)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
 		return
 	}
+
+	logEvent("enrollment.stored", logFields{
+		"transactionId": trace.TransactionID,
+		"stage":         trace.Stage,
+		"source":        trace.Source,
+		"receivedAt":    trace.ReceivedAt.Format(time.RFC3339),
+	})
+	coreBusinessTransactionsTotal.WithLabelValues("enrollment", "accepted").Inc()
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":        "accepted",
@@ -393,6 +594,13 @@ func (a *app) handleCreatePasswordChange(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	logEvent("password-change.received", logFields{
+		"requestId":         payload.RequestID,
+		"transactionId":     payload.TransactionID,
+		"customerEmailHash": payload.CustomerEmailHash,
+		"remote":            r.RemoteAddr,
+	})
+
 	row := a.db.QueryRow(ctx, `INSERT INTO customer_password_change_traces (
 			request_id,
 			transaction_id,
@@ -407,13 +615,22 @@ func (a *app) handleCreatePasswordChange(w http.ResponseWriter, r *http.Request)
 			source = EXCLUDED.source,
 			stage = EXCLUDED.stage
 		RETURNING request_id, transaction_id, customer_email_hash, requested_at, source, stage`,
-		payload.RequestID, payload.TransactionID, payload.CustomerEmailHash, "bff-customer", "password_change_requested")
+		payload.RequestID, payload.TransactionID, payload.CustomerEmailHash, "bff-points", "password_change_requested")
 
 	trace, err := scanPasswordChange(row)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
 		return
 	}
+
+	logEvent("password-change.stored", logFields{
+		"requestId":     trace.RequestID,
+		"transactionId": trace.TransactionID,
+		"stage":         trace.Stage,
+		"source":        trace.Source,
+		"requestedAt":   trace.RequestedAt.Format(time.RFC3339),
+	})
+	coreBusinessTransactionsTotal.WithLabelValues("password_change", "accepted").Inc()
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":        "accepted",
@@ -464,6 +681,14 @@ func (a *app) handleCreateLogin(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	logEvent("login.received", logFields{
+		"loginId":           payload.LoginID,
+		"requestId":         payload.RequestID,
+		"transactionId":     payload.TransactionID,
+		"customerEmailHash": payload.CustomerEmailHash,
+		"remote":            r.RemoteAddr,
+	})
+
 	row := a.db.QueryRow(ctx, `INSERT INTO customer_login_traces (
 			login_id,
 			request_id,
@@ -480,13 +705,23 @@ func (a *app) handleCreateLogin(w http.ResponseWriter, r *http.Request) {
 			source = EXCLUDED.source,
 			stage = EXCLUDED.stage
 		RETURNING login_id, request_id, transaction_id, customer_email_hash, authenticated_at, source, stage`,
-		payload.LoginID, payload.RequestID, payload.TransactionID, payload.CustomerEmailHash, "bff-customer", "authenticated")
+		payload.LoginID, payload.RequestID, payload.TransactionID, payload.CustomerEmailHash, "bff-points", "authenticated")
 
 	trace, err := scanLogin(row)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
 		return
 	}
+
+	logEvent("login.stored", logFields{
+		"loginId":         trace.LoginID,
+		"requestId":       trace.RequestID,
+		"transactionId":   trace.TransactionID,
+		"stage":           trace.Stage,
+		"source":          trace.Source,
+		"authenticatedAt": trace.AuthenticatedAt.Format(time.RFC3339),
+	})
+	coreBusinessTransactionsTotal.WithLabelValues("login", "accepted").Inc()
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":          "accepted",
@@ -496,6 +731,67 @@ func (a *app) handleCreateLogin(w http.ResponseWriter, r *http.Request) {
 		"authenticatedAt": trace.AuthenticatedAt,
 		"storage":         "postgres",
 	})
+}
+
+func (a *app) handleGetCustomerProfileSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "path": r.URL.Path})
+		return
+	}
+
+	customerID, ok := customerIDFromProfileSummaryPath(r.URL.Path)
+	if !ok || strings.TrimSpace(customerID) == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "path": r.URL.Path})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	logEvent("profile-summary.requested", logFields{
+		"customerId": customerID,
+		"remote":     r.RemoteAddr,
+	})
+
+	row := a.db.QueryRow(ctx, `SELECT
+			customer_id,
+			customer_email_hash,
+			first_name,
+			last_name,
+			loyalty_tier,
+			enrollment_status,
+			enrollment_transaction_id,
+			password_change_status,
+			password_change_request_id,
+			last_login_id,
+			last_login_at,
+			source,
+			stage,
+			updated_at
+		FROM customer_profiles
+		WHERE customer_id = $1`, customerID)
+
+	summary, err := scanCustomerProfileSummary(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			logEvent("profile-summary.not-found", logFields{"customerId": customerID})
+			writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "customerId": customerID})
+			return
+		}
+		logEvent("profile-summary.error", logFields{"customerId": customerID, "message": "database_unavailable"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+
+	logEvent("profile-summary.found", logFields{
+		"customerId":  summary.CustomerID,
+		"loyaltyTier": summary.LoyaltyTier,
+		"stage":       summary.Stage,
+		"updatedAt":   summary.UpdatedAt.Format(time.RFC3339),
+	})
+	coreBusinessTransactionsTotal.WithLabelValues("profile_summary", "served").Inc()
+
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func scanEnrollment(row rowScanner) (enrollmentTrace, error) {
@@ -514,6 +810,44 @@ func scanLogin(row rowScanner) (loginTrace, error) {
 	var trace loginTrace
 	err := row.Scan(&trace.LoginID, &trace.RequestID, &trace.TransactionID, &trace.CustomerEmailHash, &trace.AuthenticatedAt, &trace.Source, &trace.Stage)
 	return trace, err
+}
+
+func scanCustomerProfileSummary(row rowScanner) (customerProfileSummary, error) {
+	var summary customerProfileSummary
+	err := row.Scan(
+		&summary.CustomerID,
+		&summary.CustomerEmailHash,
+		&summary.FirstName,
+		&summary.LastName,
+		&summary.LoyaltyTier,
+		&summary.EnrollmentStatus,
+		&summary.EnrollmentTransactionID,
+		&summary.PasswordChangeStatus,
+		&summary.PasswordChangeRequestID,
+		&summary.LastLoginID,
+		&summary.LastLoginAt,
+		&summary.Source,
+		&summary.Stage,
+		&summary.UpdatedAt,
+	)
+	return summary, err
+}
+
+func customerIDFromProfileSummaryPath(path string) (string, bool) {
+	const prefix = "/v1/customers/"
+	const suffix = "/profile-summary"
+
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+
+	customerID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	customerID = strings.Trim(customerID, "/")
+	if customerID == "" || strings.Contains(customerID, "/") {
+		return "", false
+	}
+
+	return customerID, true
 }
 
 func decodeJSONBody(r *http.Request, target any) error {

@@ -81,6 +81,64 @@ func TestScanEnrollment(t *testing.T) {
 	}
 }
 
+func TestScanCustomerProfileSummary(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	summary, err := scanCustomerProfileSummary(fakeRow{values: []any{
+		"cust_001",
+		"hash_cust_001_demo",
+		"Pablo",
+		"Velasquez",
+		"gold",
+		"enrolled",
+		"tx-demo-001",
+		"completed",
+		"pwd-demo-001",
+		"login-demo-001",
+		now,
+		"core-customer",
+		"profile_summary_ready",
+		now,
+	}})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	if summary.CustomerID != "cust_001" || summary.LoyaltyTier != "gold" || !summary.LastLoginAt.Equal(now) {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+}
+
+func TestCustomerIDFromProfileSummaryPath(t *testing.T) {
+	customerID, ok := customerIDFromProfileSummaryPath("/v1/customers/cust_001/profile-summary")
+	if !ok {
+		t.Fatal("expected path to be valid")
+	}
+	if customerID != "cust_001" {
+		t.Fatalf("unexpected customer id: %s", customerID)
+	}
+}
+
+func TestCustomerIDFromProfileSummaryPath_Invalid(t *testing.T) {
+	cases := []string{
+		"/v1/customers//profile-summary",
+		"/v1/customers/cust_001/profile",
+		"/v1/customers/cust_001/profile-summary/extra",
+	}
+
+	for _, path := range cases {
+		if customerID, ok := customerIDFromProfileSummaryPath(path); ok || customerID != "" {
+			t.Fatalf("expected invalid path %q, got (%q, %v)", path, customerID, ok)
+		}
+	}
+}
+
+func TestNormalizeRoute_ProfileSummary(t *testing.T) {
+	route := normalizeRoute("/v1/customers/cust_001/profile-summary")
+	if route != "/v1/customers/:customerId/profile-summary" {
+		t.Fatalf("unexpected route: %s", route)
+	}
+}
+
 func TestMustEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://example")
 	value, err := mustEnv("DATABASE_URL")

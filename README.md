@@ -1,4 +1,4 @@
-# loyalty-core-customer
+# loyalty-core-points
 
 Technical core service for the **customer** vertical of the loyalty platform.
 
@@ -8,7 +8,7 @@ This repository now runs on **Go + Postgres** and keeps the same traceability co
 
 ## What this service is responsible for
 
-`loyalty-core-customer` validates the backend side of traceability.
+`loyalty-core-points` validates the backend side of traceability.
 
 It is responsible for:
 
@@ -92,7 +92,7 @@ Build binary:
 
 ```bash
 export PATH="$(pwd)/.tooling/go/bin:$PATH"
-go build -o bin/core-customer .
+go build -o bin/core-points .
 ```
 
 Test:
@@ -126,7 +126,7 @@ This repository now aligns with the project’s intended core direction:
 
 Related docs:
 
-- `../docs/architecture/core-customer-contract.md`
+- `../docs/architecture/core-points-contract.md`
 - `../docs/architecture/architecture-decision.md`
 
 ---
