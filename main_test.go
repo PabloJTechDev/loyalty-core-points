@@ -149,3 +149,25 @@ func TestMustEnv(t *testing.T) {
 		t.Fatalf("unexpected env value: %s", value)
 	}
 }
+
+func TestScanPasswordChange(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	trace, err := scanPasswordChange(fakeRow{values: []any{"req-1", "tx-1", "hash-1", now, "bff-points", "password_change_requested"}})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if trace.RequestID != "req-1" || trace.TransactionID != "tx-1" {
+		t.Fatalf("unexpected trace: %+v", trace)
+	}
+}
+
+func TestScanLogin(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	trace, err := scanLogin(fakeRow{values: []any{"login-1", "req-1", "tx-1", "hash-1", now, "bff-points", "authenticated"}})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if trace.LoginID != "login-1" || trace.RequestID != "req-1" {
+		t.Fatalf("unexpected trace: %+v", trace)
+	}
+}

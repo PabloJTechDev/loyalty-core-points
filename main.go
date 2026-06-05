@@ -150,6 +150,16 @@ type enrollmentListResponse struct {
 	Items []enrollmentTrace `json:"items"`
 }
 
+type passwordChangeListResponse struct {
+	Total int                   `json:"total"`
+	Items []passwordChangeTrace `json:"items"`
+}
+
+type loginListResponse struct {
+	Total int          `json:"total"`
+	Items []loginTrace `json:"items"`
+}
+
 type customerProfileSummary struct {
 	CustomerID              string    `json:"customerId"`
 	CustomerEmailHash       string    `json:"customerEmailHash"`
@@ -286,6 +296,8 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("/v1/customer-enrollments/", a.handleGetEnrollment)
 	mux.HandleFunc("/v1/customer-password-changes", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
+		case http.MethodGet:
+			a.handleListPasswordChanges(w, r)
 		case http.MethodPost:
 			a.handleCreatePasswordChange(w, r)
 		default:
@@ -295,6 +307,8 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("/v1/customer-password-changes/", a.handleGetPasswordChange)
 	mux.HandleFunc("/v1/customer-logins", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
+		case http.MethodGet:
+			a.handleListLogins(w, r)
 		case http.MethodPost:
 			a.handleCreateLogin(w, r)
 		default:
@@ -554,6 +568,37 @@ func (a *app) handleCreateEnrollment(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *app) handleListPasswordChanges(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := a.db.Query(ctx, `SELECT request_id, transaction_id, customer_email_hash, requested_at, source, stage
+		FROM customer_password_change_traces
+		ORDER BY requested_at DESC`)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+	defer rows.Close()
+
+	items := make([]passwordChangeTrace, 0)
+	for rows.Next() {
+		trace, err := scanPasswordChange(rows)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+			return
+		}
+		items = append(items, trace)
+	}
+
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, passwordChangeListResponse{Total: len(items), Items: items})
+}
+
 func (a *app) handleGetPasswordChange(w http.ResponseWriter, r *http.Request) {
 	requestID := strings.TrimPrefix(r.URL.Path, "/v1/customer-password-changes/")
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -639,6 +684,37 @@ func (a *app) handleCreatePasswordChange(w http.ResponseWriter, r *http.Request)
 		"requestedAt":   trace.RequestedAt,
 		"storage":       "postgres",
 	})
+}
+
+func (a *app) handleListLogins(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := a.db.Query(ctx, `SELECT login_id, request_id, transaction_id, customer_email_hash, authenticated_at, source, stage
+		FROM customer_login_traces
+		ORDER BY authenticated_at DESC`)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+	defer rows.Close()
+
+	items := make([]loginTrace, 0)
+	for rows.Next() {
+		trace, err := scanLogin(rows)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+			return
+		}
+		items = append(items, trace)
+	}
+
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, loginListResponse{Total: len(items), Items: items})
 }
 
 func (a *app) handleGetLogin(w http.ResponseWriter, r *http.Request) {
