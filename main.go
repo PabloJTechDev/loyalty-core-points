@@ -282,6 +282,7 @@ func (w *metricsResponseWriter) WriteHeader(statusCode int) {
 func (a *app) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", a.handleHealth)
+	mux.HandleFunc("/v1/stats", a.handleStats)
 	mux.HandleFunc("/metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}).ServeHTTP)
 	mux.HandleFunc("/v1/customer-enrollments", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -439,6 +440,49 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 		{query: `SELECT COUNT(*)::int FROM customer_password_change_traces`, target: &response.ReceivedPasswordChanges},
 		{query: `SELECT COUNT(*)::int FROM customer_login_traces`, target: &response.ReceivedLogins},
 		{query: `SELECT COUNT(*)::int FROM customer_profiles`, target: &response.ReceivedProfiles},
+	}
+
+	for _, item := range queries {
+		if err := a.db.QueryRow(ctx, item.query).Scan(item.target); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status":  "error",
+				"service": "core-points",
+				"message": "database_unavailable",
+			})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+type pointsStatsResponse struct {
+	TotalEnrollments    int32 `json:"totalEnrollments"`
+	TotalPasswordChanges int32 `json:"totalPasswordChanges"`
+	TotalLogins         int32 `json:"totalLogins"`
+	PendingEnrollments  int32 `json:"pendingEnrollments"`
+	PendingPasswordChanges int32 `json:"pendingPasswordChanges"`
+}
+
+func (a *app) handleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	response := pointsStatsResponse{}
+
+	queries := []struct {
+		query  string
+		target *int32
+	}{
+		{query: `SELECT COUNT(*)::int FROM customer_enrollment_traces`, target: &response.TotalEnrollments},
+		{query: `SELECT COUNT(*)::int FROM customer_password_change_traces`, target: &response.TotalPasswordChanges},
+		{query: `SELECT COUNT(*)::int FROM customer_login_traces`, target: &response.TotalLogins},
+		{query: `SELECT COUNT(*)::int FROM customer_enrollment_traces WHERE stage = 'pending'`, target: &response.PendingEnrollments},
+		{query: `SELECT COUNT(*)::int FROM customer_password_change_traces WHERE stage = 'pending'`, target: &response.PendingPasswordChanges},
 	}
 
 	for _, item := range queries {
