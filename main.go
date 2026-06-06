@@ -318,6 +318,9 @@ func (a *app) routes() http.Handler {
 	})
 	mux.HandleFunc("/v1/customer-logins/", a.handleGetLogin)
 	mux.HandleFunc("/v1/customers/", a.handleGetCustomerProfileSummary)
+	mux.HandleFunc("/v1/points/accrue", a.handleAccruePoints)
+	mux.HandleFunc("/v1/points/redeem", a.handleRedeemPoints)
+	mux.HandleFunc("/v1/points/", a.handlePointsRouter)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedAt := time.Now()
@@ -411,6 +414,24 @@ func (a *app) initDB(ctx context.Context) error {
 			TIMESTAMPTZ '2026-06-03T18:45:00Z'
 		)
 		ON CONFLICT (customer_id) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS point_accounts (
+			customer_id TEXT PRIMARY KEY,
+			balance_points INTEGER NOT NULL DEFAULT 0,
+			lifetime_accrued INTEGER NOT NULL DEFAULT 0,
+			lifetime_redeemed INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS point_transactions (
+			transaction_id TEXT PRIMARY KEY,
+			customer_id TEXT NOT NULL,
+			type TEXT NOT NULL,
+			points INTEGER NOT NULL,
+			reference_id TEXT NOT NULL,
+			source TEXT NOT NULL,
+			description TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_point_transactions_customer_id ON point_transactions(customer_id)`,
 	}
 
 	for _, statement := range statements {
@@ -1010,4 +1031,220 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		log.Printf("failed to encode response: %v", err)
 	}
+}
+
+// ─── Points structs ──────────────────────────────────────────────────────────
+
+type accruePointsRequest struct {
+	CustomerID  string `json:"customerId"`
+	Points      int    `json:"points"`
+	ReferenceID string `json:"referenceId"`
+	Source      string `json:"source"`
+	Description string `json:"description"`
+}
+
+type redeemPointsRequest struct {
+	CustomerID  string `json:"customerId"`
+	Points      int    `json:"points"`
+	ReferenceID string `json:"referenceId"`
+	Source      string `json:"source"`
+	Description string `json:"description"`
+}
+
+type pointBalanceResponse struct {
+	CustomerID       string `json:"customerId"`
+	BalancePoints    int    `json:"balancePoints"`
+	LifetimeAccrued  int    `json:"lifetimeAccrued"`
+	LifetimeRedeemed int    `json:"lifetimeRedeemed"`
+	UpdatedAt        string `json:"updatedAt"`
+}
+
+type pointTransactionResponse struct {
+	TransactionID string `json:"transactionId"`
+	CustomerID    string `json:"customerId"`
+	Type          string `json:"type"`
+	Points        int    `json:"points"`
+	ReferenceID   string `json:"referenceId"`
+	Source        string `json:"source"`
+	Description   string `json:"description"`
+	CreatedAt     string `json:"createdAt"`
+}
+
+// ─── Points handlers ─────────────────────────────────────────────────────────
+
+func (a *app) handleAccruePoints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var req accruePointsRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeBadRequest(w, err)
+		return
+	}
+	if req.CustomerID == "" || req.Points <= 0 || req.ReferenceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "error", "message": "customerId, points > 0, and referenceId are required"})
+		return
+	}
+
+	txID := "ptx_accrue_" + req.ReferenceID
+
+	_, err := a.db.Exec(ctx, `
+		INSERT INTO point_accounts (customer_id, balance_points, lifetime_accrued, updated_at)
+		VALUES ($1, $2, $2, NOW())
+		ON CONFLICT (customer_id) DO UPDATE
+		SET balance_points   = point_accounts.balance_points + $2,
+		    lifetime_accrued = point_accounts.lifetime_accrued + $2,
+		    updated_at       = NOW()
+	`, req.CustomerID, req.Points)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_error"})
+		return
+	}
+
+	_, err = a.db.Exec(ctx, `
+		INSERT INTO point_transactions (transaction_id, customer_id, type, points, reference_id, source, description)
+		VALUES ($1, $2, 'accrue', $3, $4, $5, $6)
+		ON CONFLICT (transaction_id) DO NOTHING
+	`, txID, req.CustomerID, req.Points, req.ReferenceID, req.Source, req.Description)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "transactionId": txID, "accrued": req.Points})
+}
+
+func (a *app) handleRedeemPoints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var req redeemPointsRequest
+	if err := decodeJSONBody(r, &req); err != nil {
+		writeBadRequest(w, err)
+		return
+	}
+	if req.CustomerID == "" || req.Points <= 0 || req.ReferenceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "error", "message": "customerId, points > 0, and referenceId are required"})
+		return
+	}
+
+	txID := "ptx_redeem_" + req.ReferenceID
+
+	// Check balance
+	var balance int
+	err := a.db.QueryRow(ctx, `SELECT balance_points FROM point_accounts WHERE customer_id = $1`, req.CustomerID).Scan(&balance)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "error", "message": "customer_account_not_found"})
+		return
+	}
+	if balance < req.Points {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"status": "insufficient_points", "available": balance, "requested": req.Points})
+		return
+	}
+
+	_, err = a.db.Exec(ctx, `
+		UPDATE point_accounts
+		SET balance_points    = balance_points - $2,
+		    lifetime_redeemed = lifetime_redeemed + $2,
+		    updated_at        = NOW()
+		WHERE customer_id = $1
+	`, req.CustomerID, req.Points)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_error"})
+		return
+	}
+
+	_, err = a.db.Exec(ctx, `
+		INSERT INTO point_transactions (transaction_id, customer_id, type, points, reference_id, source, description)
+		VALUES ($1, $2, 'redeem', $3, $4, $5, $6)
+		ON CONFLICT (transaction_id) DO NOTHING
+	`, txID, req.CustomerID, req.Points, req.ReferenceID, req.Source, req.Description)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "transactionId": txID, "redeemed": req.Points, "remainingBalance": balance - req.Points})
+}
+
+func (a *app) handlePointsRouter(w http.ResponseWriter, r *http.Request) {
+	// /v1/points/{customerId}/balance  GET
+	// /v1/points/{customerId}/transactions  GET
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/points/"), "/")
+	if len(parts) < 2 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found"})
+		return
+	}
+	customerID := parts[0]
+	action := parts[1]
+
+	switch action {
+	case "balance":
+		a.handleGetBalance(w, r, customerID)
+	case "transactions":
+		a.handleGetTransactions(w, r, customerID)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found"})
+	}
+}
+
+func (a *app) handleGetBalance(w http.ResponseWriter, r *http.Request, customerID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	var resp pointBalanceResponse
+	resp.CustomerID = customerID
+	err := a.db.QueryRow(ctx, `
+		SELECT balance_points, lifetime_accrued, lifetime_redeemed, updated_at
+		FROM point_accounts WHERE customer_id = $1
+	`, customerID).Scan(&resp.BalancePoints, &resp.LifetimeAccrued, &resp.LifetimeRedeemed, &resp.UpdatedAt)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "message": "account not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *app) handleGetTransactions(w http.ResponseWriter, r *http.Request, customerID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	rows, err := a.db.Query(ctx, `
+		SELECT transaction_id, customer_id, type, points, reference_id, source, description, created_at
+		FROM point_transactions
+		WHERE customer_id = $1
+		ORDER BY created_at DESC
+		LIMIT 50
+	`, customerID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+	defer rows.Close()
+
+	items := []pointTransactionResponse{}
+	for rows.Next() {
+		var item pointTransactionResponse
+		if err := rows.Scan(&item.TransactionID, &item.CustomerID, &item.Type, &item.Points, &item.ReferenceID, &item.Source, &item.Description, &item.CreatedAt); err != nil {
+			continue
+		}
+		items = append(items, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": len(items)})
 }
