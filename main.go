@@ -1052,11 +1052,11 @@ type redeemPointsRequest struct {
 }
 
 type pointBalanceResponse struct {
-	CustomerID       string `json:"customerId"`
-	BalancePoints    int    `json:"balancePoints"`
-	LifetimeAccrued  int    `json:"lifetimeAccrued"`
-	LifetimeRedeemed int    `json:"lifetimeRedeemed"`
-	UpdatedAt        string `json:"updatedAt"`
+	CustomerID       string    `json:"customerId"`
+	BalancePoints    int       `json:"balancePoints"`
+	LifetimeAccrued  int       `json:"lifetimeAccrued"`
+	LifetimeRedeemed int       `json:"lifetimeRedeemed"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 type pointTransactionResponse struct {
