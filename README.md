@@ -63,6 +63,33 @@ Also consumed cross-vertically by `bff-ecommerce` (post-order accrual) and `bff-
 
 ---
 
+## Architecture
+
+Clean Architecture with Go journey packages under `internal/`:
+
+```
+internal/
+  shared/        → WriteJSON, DecodeJSONBody, LogEvent, Prometheus metrics, RowScanner
+  enrollment/    → types, usecase, handler, postgres  (customer enrollment traces)
+  auth/          → types, usecase, handler, postgres  (logins + password changes)
+  customer/      → types, usecase, handler, postgres  (profile summary + email hash lookup)
+  points/        → types, usecase, handler, postgres  (balance, transactions, accrue, redeem, stats)
+main.go          → DB init, route wiring, graceful shutdown
+```
+
+Each journey package follows the same layering:
+
+| File | Responsibility |
+|---|---|
+| `types.go` | Domain entity types + repository interface |
+| `usecase.go` | Business logic (calls the repository interface) |
+| `handler.go` | HTTP handler (calls use cases, writes JSON) |
+| `postgres.go` | Postgres implementation of the repository interface |
+
+Dependency injection is done by constructor functions in `main.go` — no framework.
+
+---
+
 ## Data model (Postgres)
 
 ```
