@@ -1,140 +1,127 @@
 # loyalty-core-points
 
-Technical core service for the **customer** vertical of the loyalty platform.
+Go microservice — points engine and customer trazabilidad core for the loyalty platform.
 
-This repository now runs on **Go + Postgres** and keeps the same traceability contract already consumed by the BFF and web layers.
+Part of the **points vertical**: `web-points` → `bff-points` → **`core-points`**
 
----
-
-## What this service is responsible for
-
-`loyalty-core-points` validates the backend side of traceability.
-
-It is responsible for:
-
-- receiving handoff payloads from the BFF
-- persisting technical traces in Postgres
-- exposing lookup endpoints for each stage id
-- acting as a contract-validation layer for the portfolio journey
+Also consumed cross-vertically by `bff-ecommerce` (post-order accrual) and `bff-backoffice` (customer audit + program stats).
 
 ---
 
-## Journey records currently supported
+## Responsibilities
 
-This core service persists 3 types of traces:
+### Points engine
+- **Accrue** points per customer (reference-linked, idempotent)
+- **Redeem** points at checkout (balance check + atomic debit)
+- **Balance** and **transaction history** per customer
+- Program-wide aggregate stats: total points in circulation, lifetime accrued/redeemed
 
-- **customer enrollments**
-- **customer password changes**
-- **customer logins**
-
-Identifiers supported:
-
-- `transactionId`
-- `requestId`
-- `loginId`
-
-It also stores the reusable technical context passed from the BFF:
-
-- `customerEmailHash`
+### Customer trazabilidad
+- Persist and retrieve enrollment, password-change, and login traces
+- Customer profile management (deterministic `customerId` from email hash)
+- Lookup customer by email hash (used by login flow to resolve real `customerId`)
 
 ---
 
 ## Endpoints
 
-- `GET /health`
-- `POST /v1/customer-enrollments`
-- `GET /v1/customer-enrollments`
-- `GET /v1/customer-enrollments/:transactionId`
-- `POST /v1/customer-password-changes`
-- `GET /v1/customer-password-changes/:requestId`
-- `POST /v1/customer-logins`
-- `GET /v1/customer-logins/:loginId`
+### Points engine
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/points/accrue` | Accrue points for a customer |
+| `POST` | `/v1/points/redeem` | Redeem points (with balance check) |
+| `GET` | `/v1/points/:customerId/balance` | Current balance + lifetime stats |
+| `GET` | `/v1/points/:customerId/transactions` | Transaction history (last 50) |
+
+### Customer trazabilidad
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/customer-enrollments` | Create enrollment trace + auto-upsert customer profile |
+| `GET` | `/v1/customer-enrollments` | List all enrollment traces |
+| `GET` | `/v1/customer-enrollments/:transactionId` | Get enrollment trace by ID |
+| `POST` | `/v1/customer-password-changes` | Create password change trace |
+| `GET` | `/v1/customer-password-changes/:requestId` | Get password change trace |
+| `POST` | `/v1/customer-logins` | Create login trace |
+| `GET` | `/v1/customer-logins/:loginId` | Get login trace |
+
+### Customer profiles
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/v1/customers/:customerId/profile-summary` | Customer profile summary |
+| `GET` | `/v1/customers/by-hash/:emailHash` | Lookup customerId by email hash |
+
+### Observability
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Health check with DB counts |
+| `GET` | `/v1/stats` | Program stats: enrollments, logins, points in circulation |
+| `GET` | `/metrics` | Prometheus metrics |
 
 ---
 
-## Technical highlights
+## Data model (Postgres)
 
-- **Go HTTP service** with standard library routing
-- **Postgres-backed persistence** for technical traces
-- **idempotent upserts** for trace updates per journey id
-- **lookup endpoints** used by the BFF and trace screens
-- lightweight implementation, but already aligned with the intended core stack
+```
+point_accounts          — balance_points, lifetime_accrued, lifetime_redeemed per customer
+point_transactions      — type (accrue|redeem), points, reference_id, source, description
+customer_profiles       — customerId (cust_<hash12>), tier, enrollment/login/password status
+customer_enrollment_traces     — transactionId, customerEmailHash, stage
+customer_password_change_traces — requestId, transactionId, stage
+customer_login_traces           — loginId, requestId, transactionId, stage
+```
 
 ---
 
-## Environment
+## Cross-vertical integration
 
-Create the local env file:
+**core-ecommerce → core-points (async, post-order):**
+```
+POST /v1/points/accrue   — 10 pts per USD of order subtotal
+POST /v1/points/redeem   — if customer redeemed points at checkout
+```
+
+**bff-backoffice → core-points:**
+```
+GET /v1/stats                              — program KPIs for dashboard
+GET /v1/customers/:id/profile-summary      — customer detail
+GET /v1/points/:customerId/balance         — customer point balance
+GET /v1/points/:customerId/transactions    — audit history
+```
+
+---
+
+## Tech stack
+
+- **Go 1.22** (stdlib `net/http`)
+- **pgx/v5** + `pgxpool` for Postgres
+- **Prometheus** client (custom registry)
+- Structured JSON logging
+- Schema auto-migration via `initDB()`
+
+---
+
+## Running locally
 
 ```bash
 cp .env.example .env
-```
+# Edit DATABASE_URL
 
-Main variables:
-
-- `PORT=3001`
-- `APP_ENV=development`
-- `DATABASE_URL=postgresql://loyalty_app:loyalty_app_dev_2026@127.0.0.1:5432/loyalty_platform` _(required)_
-
----
-
-## Run locally
-
-Using the repo-local Go toolchain I left under `.tooling/go`:
-
-```bash
-export PATH="$(pwd)/.tooling/go/bin:$PATH"
-go mod tidy
 go run .
 ```
 
-Build binary:
+### Environment variables
 
-```bash
-export PATH="$(pwd)/.tooling/go/bin:$PATH"
-go build -o bin/core-points .
-```
-
-Test:
-
-```bash
-export PATH="$(pwd)/.tooling/go/bin:$PATH"
-go test ./...
-```
+| Variable | Description |
+|---|---|
+| `PORT` | HTTP listen port (default `3001`) |
+| `DATABASE_URL` | PostgreSQL connection string |
 
 ---
 
-## Validation status
+## Part of loyalty-platform
 
-Expected validation gates for this repo:
-
-- `go test ./...`
-- `go build ./...`
-- Docker image build
-
-If CI is green, the service is ready to be consumed by the BFF with the same HTTP contract.
-
----
-
-## Architecture note
-
-This repository now aligns with the project’s intended core direction:
-
-- Go as core stack
-- explicit technical contract for handoff traces
-- room to evolve toward cleaner domain boundaries later
-
-Related docs:
-
-- `../docs/architecture/core-points-contract.md`
-- `../docs/architecture/architecture-decision.md`
-
----
-
-## What I would improve next
-
-1. split handlers, repository, and bootstrap into separate packages
-2. add integration tests with ephemeral Postgres
-3. version the API contract explicitly
-4. add migrations instead of boot-time table creation
-5. align naming with the future domain model once the functional scope grows
+See the [monorepo root](https://github.com/PabloJTechDev/loyalty-platform) for the full architecture, port map, and Docker Compose setup.
