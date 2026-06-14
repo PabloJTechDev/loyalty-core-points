@@ -258,6 +258,8 @@ func normalizeRoute(path string) string {
 		return "/v1/customer-password-changes/:requestId"
 	case strings.HasPrefix(path, "/v1/customer-logins/"):
 		return "/v1/customer-logins/:loginId"
+	case strings.HasPrefix(path, "/v1/customers/by-hash/"):
+		return "/v1/customers/by-hash/:emailHash"
 	case strings.HasPrefix(path, "/v1/customers/") && strings.HasSuffix(path, "/profile-summary"):
 		return "/v1/customers/:customerId/profile-summary"
 	default:
@@ -317,6 +319,7 @@ func (a *app) routes() http.Handler {
 		}
 	})
 	mux.HandleFunc("/v1/customer-logins/", a.handleGetLogin)
+	mux.HandleFunc("/v1/customers/by-hash/", a.handleGetCustomerByEmailHash)
 	mux.HandleFunc("/v1/customers/", a.handleGetCustomerProfileSummary)
 	mux.HandleFunc("/v1/points/accrue", a.handleAccruePoints)
 	mux.HandleFunc("/v1/points/redeem", a.handleRedeemPoints)
@@ -642,6 +645,23 @@ func (a *app) handleCreateEnrollment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Auto-upsert customer profile with deterministic customerId
+	customerID := deriveCustomerID(payload.CustomerEmailHash)
+	_, _ = a.db.Exec(ctx, `INSERT INTO customer_profiles (
+			customer_id, customer_email_hash, first_name, last_name,
+			loyalty_tier, enrollment_status, enrollment_transaction_id,
+			password_change_status, password_change_request_id,
+			last_login_id, last_login_at, source, stage, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), $11, $12, NOW())
+		ON CONFLICT (customer_id) DO UPDATE SET
+			enrollment_status = 'enrolled',
+			enrollment_transaction_id = EXCLUDED.enrollment_transaction_id,
+			updated_at = NOW()`,
+		customerID, payload.CustomerEmailHash, "Customer", "",
+		"silver", "enrolled", payload.TransactionID,
+		"pending", "",
+		"enrollment", "bff-points", "profile_created")
+
 	logEvent("enrollment.stored", logFields{
 		"transactionId": trace.TransactionID,
 		"stage":         trace.Stage,
@@ -897,6 +917,53 @@ func (a *app) handleCreateLogin(w http.ResponseWriter, r *http.Request) {
 		"authenticatedAt": trace.AuthenticatedAt,
 		"storage":         "postgres",
 	})
+}
+
+type customerByHashResponse struct {
+	CustomerID        string `json:"customerId"`
+	CustomerEmailHash string `json:"customerEmailHash"`
+	LoyaltyTier       string `json:"loyaltyTier"`
+	EnrollmentStatus  string `json:"enrollmentStatus"`
+}
+
+func deriveCustomerID(emailHash string) string {
+	if len(emailHash) >= 12 {
+		return "cust_" + emailHash[:12]
+	}
+	return "cust_" + emailHash
+}
+
+func (a *app) handleGetCustomerByEmailHash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"status": "method_not_allowed"})
+		return
+	}
+
+	emailHash := strings.TrimPrefix(r.URL.Path, "/v1/customers/by-hash/")
+	emailHash = strings.Trim(emailHash, "/")
+	if emailHash == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"status": "error", "message": "emailHash is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	var resp customerByHashResponse
+	err := a.db.QueryRow(ctx, `SELECT customer_id, customer_email_hash, loyalty_tier, enrollment_status
+		FROM customer_profiles WHERE customer_email_hash = $1`, emailHash).Scan(
+		&resp.CustomerID, &resp.CustomerEmailHash, &resp.LoyaltyTier, &resp.EnrollmentStatus,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"status": "not_found", "emailHash": emailHash})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"status": "error", "message": "database_unavailable"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *app) handleGetCustomerProfileSummary(w http.ResponseWriter, r *http.Request) {
