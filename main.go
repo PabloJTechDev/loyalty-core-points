@@ -478,11 +478,15 @@ func (a *app) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type pointsStatsResponse struct {
-	TotalEnrollments    int32 `json:"totalEnrollments"`
-	TotalPasswordChanges int32 `json:"totalPasswordChanges"`
-	TotalLogins         int32 `json:"totalLogins"`
-	PendingEnrollments  int32 `json:"pendingEnrollments"`
+	TotalEnrollments       int32 `json:"totalEnrollments"`
+	TotalPasswordChanges   int32 `json:"totalPasswordChanges"`
+	TotalLogins            int32 `json:"totalLogins"`
+	PendingEnrollments     int32 `json:"pendingEnrollments"`
 	PendingPasswordChanges int32 `json:"pendingPasswordChanges"`
+	TotalPointsInCirculation int64 `json:"totalPointsInCirculation"`
+	TotalLifetimeAccrued     int64 `json:"totalLifetimeAccrued"`
+	TotalLifetimeRedeemed    int64 `json:"totalLifetimeRedeemed"`
+	TotalActiveAccounts      int32 `json:"totalActiveAccounts"`
 }
 
 func (a *app) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -495,7 +499,7 @@ func (a *app) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	response := pointsStatsResponse{}
 
-	queries := []struct {
+	int32Queries := []struct {
 		query  string
 		target *int32
 	}{
@@ -504,9 +508,30 @@ func (a *app) handleStats(w http.ResponseWriter, r *http.Request) {
 		{query: `SELECT COUNT(*)::int FROM customer_login_traces`, target: &response.TotalLogins},
 		{query: `SELECT COUNT(*)::int FROM customer_enrollment_traces WHERE stage = 'pending'`, target: &response.PendingEnrollments},
 		{query: `SELECT COUNT(*)::int FROM customer_password_change_traces WHERE stage = 'pending'`, target: &response.PendingPasswordChanges},
+		{query: `SELECT COUNT(*)::int FROM point_accounts WHERE balance_points > 0`, target: &response.TotalActiveAccounts},
 	}
 
-	for _, item := range queries {
+	for _, item := range int32Queries {
+		if err := a.db.QueryRow(ctx, item.query).Scan(item.target); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status":  "error",
+				"service": "core-points",
+				"message": "database_unavailable",
+			})
+			return
+		}
+	}
+
+	int64Queries := []struct {
+		query  string
+		target *int64
+	}{
+		{query: `SELECT COALESCE(SUM(balance_points), 0) FROM point_accounts`, target: &response.TotalPointsInCirculation},
+		{query: `SELECT COALESCE(SUM(lifetime_accrued), 0) FROM point_accounts`, target: &response.TotalLifetimeAccrued},
+		{query: `SELECT COALESCE(SUM(lifetime_redeemed), 0) FROM point_accounts`, target: &response.TotalLifetimeRedeemed},
+	}
+
+	for _, item := range int64Queries {
 		if err := a.db.QueryRow(ctx, item.query).Scan(item.target); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"status":  "error",
